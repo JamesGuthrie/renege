@@ -2,22 +2,23 @@ use anyhow::Result;
 use core_foundation::base::TCFType;
 use core_foundation::number::CFNumber;
 use core_foundation::string::CFString;
-use core_foundation_sys::base::{CFGetTypeID, CFRetain, kCFAllocatorDefault};
+use core_foundation_sys::base::{CFGetTypeID, CFRelease, CFRetain, kCFAllocatorDefault};
 use core_foundation_sys::dictionary::{CFDictionarySetValue, CFMutableDictionaryRef};
 use core_foundation_sys::number::{CFNumberGetTypeID, CFNumberRef};
 use core_foundation_sys::runloop::{CFRunLoopAddSource, CFRunLoopGetMain, kCFRunLoopCommonModes};
 use io_kit_sys::keys::{kIOFirstMatchNotification, kIOTerminatedNotification};
+use io_kit_sys::ret::kIOReturnSuccess;
 use io_kit_sys::types::{io_iterator_t, io_service_t};
 use io_kit_sys::{
     IOIteratorNext, IONotificationPortCreate, IONotificationPortGetRunLoopSource, IOObjectRelease,
     IORegistryEntryCreateCFProperty, IOServiceAddMatchingNotification, IOServiceMatching,
     kIOMasterPortDefault,
 };
-use objc2::rc::Retained;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2::{MainThreadMarker, MainThreadOnly, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSColor, NSImage, NSImageSymbolConfiguration,
-    NSImageSymbolScale, NSMenu, NSMenuItem, NSStatusBar, NSStatusBarButton,
+    NSImageSymbolScale, NSMenu, NSMenuItem, NSStatusBar, NSStatusBarButton, NSStatusItem,
     NSVariableStatusItemLength,
 };
 use objc2_foundation::NSString;
@@ -29,14 +30,25 @@ const CAM_LINK_VID: i32 = 0x0fd9;
 const CAM_LINK_PID: i32 = 0x0066;
 
 unsafe extern "C" fn device_added(refcon: *mut c_void, iterator: io_iterator_t) {
-    drain_added(refcon, iterator);
+    // SAFETY:
+    //  - refcon is a valid pointer, registered with IOServiceAddMatchingNotification call
+    //  - iterator is a valid iterator given to us by IOKit
+    unsafe {
+        drain_added(refcon, iterator);
+    }
 }
 
 unsafe extern "C" fn device_removed(refcon: *mut c_void, iterator: io_iterator_t) {
-    drain_removed(refcon, iterator);
+    // SAFETY:
+    //  - refcon is a valid pointer, registered with IOServiceAddMatchingNotification call
+    //  - iterator is a valid iterator given to us by IOKit
+    unsafe {
+        drain_removed(refcon, iterator);
+    }
 }
 
-fn drain_added(refcon: *mut c_void, iterator: io_iterator_t) {
+/// SAFETY: refcon must be a valid pointer to `AppState`, and iterator must be a valid iterator
+unsafe fn drain_added(refcon: *mut c_void, iterator: io_iterator_t) {
     // SAFETY:
     //  - refcon is the pointer registered with IOServiceAddMatchingNotification
     //  - that pointer was obtained from Box::into_raw(AppState) and leaked for
@@ -63,9 +75,8 @@ fn drain_added(refcon: *mut c_void, iterator: io_iterator_t) {
     }
 }
 
-// MUST run to completion: this both processes the devices AND re-arms the
-// notification. Stop draining early and the callback never fires again.
-fn drain_removed(refcon: *mut c_void, iterator: io_iterator_t) {
+/// SAFETY: refcon must be a valid pointer to `AppState`, and iterator must be a valid iterator
+unsafe fn drain_removed(refcon: *mut c_void, iterator: io_iterator_t) {
     // SAFETY:
     //  - refcon is the pointer registered with IOServiceAddMatchingNotification
     //  - that pointer was obtained from Box::into_raw(AppState) and leaked for
@@ -94,24 +105,42 @@ fn drain_removed(refcon: *mut c_void, iterator: io_iterator_t) {
 struct AppState {
     button: Retained<NSStatusBarButton>,
     image: Retained<NSImage>,
+    #[allow(
+        dead_code,
+        reason = "status_item must not be dropped, but we don't need to read it"
+    )]
+    status_item: Retained<NSStatusItem>,
 }
 
 fn main() -> Result<()> {
-    let mtm = MainThreadMarker::new().unwrap();
-    let app = NSApplication::sharedApplication(mtm);
-    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    let app = autoreleasepool(|_pool| {
+        let mtm = MainThreadMarker::new().unwrap();
+        let app = NSApplication::sharedApplication(mtm);
+        app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
-    let (button, image) = build_menu_bar(mtm);
-    let state = Box::new(AppState { button, image });
-    let state_ptr = Box::into_raw(state);
+        let (button, image, status_item) = build_menu_bar(mtm);
+        let state = Box::new(AppState {
+            button,
+            image,
+            status_item,
+        });
+        let state_ptr = Box::into_raw(state);
 
-    register_usb_notification(state_ptr)?;
+        register_usb_notification(state_ptr)?;
+        Ok::<Retained<NSApplication>, anyhow::Error>(app)
+    })?;
 
     app.run();
     Ok(())
 }
 
-fn build_menu_bar(mtm: MainThreadMarker) -> (Retained<NSStatusBarButton>, Retained<NSImage>) {
+fn build_menu_bar(
+    mtm: MainThreadMarker,
+) -> (
+    Retained<NSStatusBarButton>,
+    Retained<NSImage>,
+    Retained<NSStatusItem>,
+) {
     let status_bar = NSStatusBar::systemStatusBar();
     let status_item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
     let menu = NSMenu::new(mtm);
@@ -134,7 +163,7 @@ fn build_menu_bar(mtm: MainThreadMarker) -> (Retained<NSStatusBarButton>, Retain
     )
     .expect("circle.fill symbol should exist on macOS 11+");
     apply_status(&button, &image, USBStatus::Disconnected);
-    (button, image)
+    (button, image, status_item)
 }
 
 fn register_usb_notification(state_ptr: *mut AppState) -> Result<()> {
@@ -191,7 +220,7 @@ fn register_usb_notification(state_ptr: *mut AppState) -> Result<()> {
         CFRetain(matching.cast::<c_void>());
     }
 
-    // 3. Register for arrival and removal — two separate notifications.
+    // Register callbacks for device addition and removal.
     let mut iter_added: io_iterator_t = 0;
     let mut iter_removed: io_iterator_t = 0;
 
@@ -202,7 +231,7 @@ fn register_usb_notification(state_ptr: *mut AppState) -> Result<()> {
     //  - state_ptr is the leaked AppState used as refcon
     //  - iter pointer is a valid out-param.
     unsafe {
-        IOServiceAddMatchingNotification(
+        let result = IOServiceAddMatchingNotification(
             notify_port,
             kIOFirstMatchNotification,
             matching,
@@ -210,7 +239,10 @@ fn register_usb_notification(state_ptr: *mut AppState) -> Result<()> {
             state_ptr.cast::<c_void>(),
             &raw mut iter_added,
         );
-        IOServiceAddMatchingNotification(
+        if result != kIOReturnSuccess {
+            anyhow::bail!("failed to add device_added notification");
+        }
+        let result = IOServiceAddMatchingNotification(
             notify_port,
             kIOTerminatedNotification,
             matching,
@@ -218,12 +250,19 @@ fn register_usb_notification(state_ptr: *mut AppState) -> Result<()> {
             state_ptr.cast::<c_void>(),
             &raw mut iter_removed,
         );
+        if result != kIOReturnSuccess {
+            anyhow::bail!("failed to add device_removed notification");
+        }
     }
 
-    // 4. Arm both: drain the initial iterators once. The "added" drain also
-    //    reports the Cam Link if it's ALREADY plugged in at launch.
-    drain_added(state_ptr.cast::<c_void>(), iter_added);
-    drain_removed(state_ptr.cast::<c_void>(), iter_removed);
+    // Arm both: drain the initial iterators once.
+    // SAFETY:
+    //  - refcon is a valid pointer to AppState
+    //  - iterator is a valid iterator given to us by IOKit
+    unsafe {
+        drain_added(state_ptr.cast::<c_void>(), iter_added);
+        drain_removed(state_ptr.cast::<c_void>(), iter_removed);
+    }
     Ok(())
 }
 
@@ -242,6 +281,8 @@ fn device_speed(service: io_service_t) -> Option<i64> {
     // Ensure that the thing we got back is actually a CFNumber
     // SAFETY: prop is a valid pointer that we got from IOKit
     if unsafe { CFGetTypeID(prop) != CFNumberGetTypeID() } {
+        // SAFETY: prop is a valid pointer that we got from IOKit, and non-null
+        unsafe { CFRelease(prop) };
         return None;
     }
     // SAFETY: we know it's a CFNumber, and was produced under the create rule

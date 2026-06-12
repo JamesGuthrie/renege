@@ -1,0 +1,13 @@
+[package]
+name = "renege"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+io-kit-sys = "0.5.0"
+core-foundation = "0.10.1"
+core-foundation-sys = "0.8.7"
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSImage", "NSStatusBar", "NSMenu", "NSMenuItem"] }
+objc2-foundation = "0.3.2"

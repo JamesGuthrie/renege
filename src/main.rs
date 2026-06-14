@@ -18,8 +18,7 @@ use objc2::rc::{Retained, autoreleasepool};
 use objc2::{MainThreadMarker, MainThreadOnly, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSColor, NSImage, NSImageSymbolConfiguration,
-    NSImageSymbolScale, NSMenu, NSMenuItem, NSStatusBar, NSStatusBarButton, NSStatusItem,
-    NSVariableStatusItemLength,
+    NSImageSymbolScale, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
 };
 use objc2_foundation::NSString;
 use std::ffi::c_void;
@@ -71,7 +70,7 @@ unsafe fn drain_added(refcon: *mut c_void, iterator: io_iterator_t) {
         unsafe { IOObjectRelease(service) };
     }
     if let Some(l) = latest {
-        apply_status(&state.button, &state.image, l);
+        state.status_icon.set_status(l);
     }
 }
 
@@ -98,18 +97,19 @@ unsafe fn drain_removed(refcon: *mut c_void, iterator: io_iterator_t) {
         }
     }
     if removed {
-        apply_status(&state.button, &state.image, USBStatus::Disconnected);
+        state.status_icon.set_status(USBStatus::Disconnected);
     }
 }
 
 struct AppState {
-    button: Retained<NSStatusBarButton>,
-    image: Retained<NSImage>,
-    #[allow(
-        dead_code,
-        reason = "status_item must not be dropped, but we don't need to read it"
-    )]
-    status_item: Retained<NSStatusItem>,
+    status_icon: StatusIcon,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum USBStatus {
+    Disconnected,
+    Negotiated,
+    Misnegotiated,
 }
 
 fn main() -> Result<()> {
@@ -118,12 +118,8 @@ fn main() -> Result<()> {
         let app = NSApplication::sharedApplication(mtm);
         app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
-        let (button, image, status_item) = build_menu_bar(mtm);
-        let state = Box::new(AppState {
-            button,
-            image,
-            status_item,
-        });
+        let status_icon = StatusIcon::new(mtm);
+        let state = Box::new(AppState { status_icon });
         let state_ptr = Box::into_raw(state);
 
         register_usb_notification(state_ptr)?;
@@ -134,36 +130,65 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn build_menu_bar(
+struct StatusIcon {
     mtm: MainThreadMarker,
-) -> (
-    Retained<NSStatusBarButton>,
-    Retained<NSImage>,
-    Retained<NSStatusItem>,
-) {
-    let status_bar = NSStatusBar::systemStatusBar();
-    let status_item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
-    let menu = NSMenu::new(mtm);
-    // SAFETY: selector is valid
-    let quit_item = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str("Quit"),
-            Some(sel!(terminate:)),
-            &NSString::from_str("q"),
-        )
-    };
+    status_item: Retained<NSStatusItem>,
+    image: Retained<NSImage>,
+}
 
-    menu.addItem(&quit_item);
-    status_item.setMenu(Some(&menu));
-    let button = status_item.button(mtm).unwrap();
-    let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-        &NSString::from_str("circle.fill"),
-        Some(&NSString::from_str("Display USB status")),
-    )
-    .expect("circle.fill symbol should exist on macOS 11+");
-    apply_status(&button, &image, USBStatus::Disconnected);
-    (button, image, status_item)
+impl StatusIcon {
+    fn new(mtm: MainThreadMarker) -> StatusIcon {
+        let status_bar = NSStatusBar::systemStatusBar();
+        let status_item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
+        let menu = NSMenu::new(mtm);
+        // SAFETY: selector is valid
+        let quit_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str("Quit"),
+                Some(sel!(terminate:)),
+                &NSString::from_str("q"),
+            )
+        };
+
+        menu.addItem(&quit_item);
+        status_item.setMenu(Some(&menu));
+        let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+            &NSString::from_str("circle.fill"),
+            Some(&NSString::from_str("Display USB status")),
+        )
+        .expect("circle.fill symbol should exist on macOS 11+");
+
+        StatusIcon {
+            mtm,
+            status_item,
+            image,
+        }
+    }
+
+    pub fn set_status(&self, status: USBStatus) {
+        let color = match status {
+            USBStatus::Disconnected => NSColor::systemGrayColor(),
+            USBStatus::Negotiated => NSColor::systemGreenColor(),
+            USBStatus::Misnegotiated => NSColor::systemRedColor(),
+        };
+
+        let colour_config = NSImageSymbolConfiguration::configurationWithHierarchicalColor(&color);
+        let size_config = NSImageSymbolConfiguration::configurationWithPointSize_weight_scale(
+            10.0,
+            0.0,
+            NSImageSymbolScale::Medium,
+        );
+        let config = size_config.configurationByApplyingConfiguration(&colour_config);
+        let colored = self
+            .image
+            .imageWithSymbolConfiguration(&config)
+            .expect("applying symbol configuration");
+        self.status_item
+            .button(self.mtm)
+            .unwrap()
+            .setImage(Some(&colored));
+    }
 }
 
 fn register_usb_notification(state_ptr: *mut AppState) -> Result<()> {
@@ -287,31 +312,4 @@ fn device_speed(service: io_service_t) -> Option<i64> {
     }
     // SAFETY: we know it's a CFNumber, and was produced under the create rule
     unsafe { CFNumber::wrap_under_create_rule(prop as CFNumberRef).to_i64() }
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum USBStatus {
-    Disconnected,
-    Negotiated,
-    Misnegotiated,
-}
-
-fn apply_status(button: &NSStatusBarButton, base: &NSImage, status: USBStatus) {
-    let color = match status {
-        USBStatus::Disconnected => NSColor::systemGrayColor(),
-        USBStatus::Negotiated => NSColor::systemGreenColor(),
-        USBStatus::Misnegotiated => NSColor::systemRedColor(),
-    };
-
-    let colour_config = NSImageSymbolConfiguration::configurationWithHierarchicalColor(&color);
-    let size_config = NSImageSymbolConfiguration::configurationWithPointSize_weight_scale(
-        10.0,
-        0.0,
-        NSImageSymbolScale::Medium,
-    );
-    let config = size_config.configurationByApplyingConfiguration(&colour_config);
-    let colored = base
-        .imageWithSymbolConfiguration(&config)
-        .expect("applying symbol configuration");
-    button.setImage(Some(&colored));
 }

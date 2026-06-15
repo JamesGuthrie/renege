@@ -45,6 +45,8 @@ impl Display for USBStatus {
 }
 
 fn main() -> Result<()> {
+    simple_logger::init()?;
+    log::info!("Starting renege v{}", env!("CARGO_PKG_VERSION"));
     let (app, _handler) = autoreleasepool(|_pool| {
         let mtm = MainThreadMarker::new().unwrap();
         let app = NSApplication::sharedApplication(mtm);
@@ -56,6 +58,7 @@ fn main() -> Result<()> {
 
         let added: Callback = Box::new(|service: io_object_t| {
             let speed = device_speed(service);
+            log::info!("device added, speed: {}", speed.unwrap_or(-1));
             let status = match speed {
                 Some(s) if s >= 3 => USBStatus::Negotiated,
                 _ => USBStatus::Misnegotiated,
@@ -63,6 +66,7 @@ fn main() -> Result<()> {
             state.status_icon.set_status(status);
         });
         let removed = Box::new(|_: io_object_t| {
+            log::info!("device removed");
             state.status_icon.set_status(USBStatus::Disconnected);
         });
 
